@@ -6,31 +6,45 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/bluesky-social/indigo/api/atproto"
+	"github.com/bluesky-social/indigo/atproto/atcrypto"
 	"github.com/bluesky-social/indigo/atproto/atdata"
+	atp "github.com/bluesky-social/indigo/atproto/repo"
+	"github.com/bluesky-social/indigo/atproto/repo/mst"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 	"github.com/bluesky-social/indigo/carstore"
 	"github.com/bluesky-social/indigo/events"
 	lexutil "github.com/bluesky-social/indigo/lex/util"
-	"github.com/bluesky-social/indigo/repo"
 	"github.com/haileyok/cocoon/internal/db"
 	"github.com/haileyok/cocoon/metrics"
 	"github.com/haileyok/cocoon/models"
 	"github.com/haileyok/cocoon/recording_blockstore"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	cbor "github.com/ipfs/go-ipld-cbor"
 	"github.com/ipld/go-car"
+	"github.com/multiformats/go-multihash"
 	"gorm.io/gorm/clause"
 )
+
+type cachedRepo struct {
+	mu   sync.Mutex
+	repo *atp.Repo
+	root cid.Cid
+}
 
 type RepoMan struct {
 	db    *db.DB
 	s     *Server
 	clock *syntax.TIDClock
+
+	cacheMu sync.Mutex
+	cache   map[string]*cachedRepo
 }
 
 func NewRepoMan(s *Server) *RepoMan {
@@ -40,7 +54,42 @@ func NewRepoMan(s *Server) *RepoMan {
 		s:     s,
 		db:    s.db,
 		clock: clock,
+		cache: make(map[string]*cachedRepo),
 	}
+}
+
+func (rm *RepoMan) withRepo(ctx context.Context, did string, rootCid cid.Cid, fn func(r *atp.Repo) (newRoot cid.Cid, err error)) error {
+	rm.cacheMu.Lock()
+	cr, ok := rm.cache[did]
+	if !ok {
+		cr = &cachedRepo{}
+		rm.cache[did] = cr
+	}
+	rm.cacheMu.Unlock()
+
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	if cr.repo == nil || cr.root != rootCid {
+		bs := rm.s.getBlockstore(did)
+		r, err := openRepo(ctx, bs, rootCid, did)
+		if err != nil {
+			return err
+		}
+		cr.repo = r
+		cr.root = rootCid
+	}
+
+	newRoot, err := fn(cr.repo)
+	if err != nil {
+		// invalidate on error since the tree may be partially mutated
+		cr.repo = nil
+		cr.root = cid.Undef
+		return err
+	}
+
+	cr.root = newRoot
+	return nil
 }
 
 type OpType string
@@ -96,6 +145,94 @@ type RepoCommit struct {
 	Rev string `json:"rev"`
 }
 
+func openRepo(ctx context.Context, bs blockstore.Blockstore, rootCid cid.Cid, did string) (*atp.Repo, error) {
+	commitBlock, err := bs.Get(ctx, rootCid)
+	if err != nil {
+		return nil, fmt.Errorf("reading commit block: %w", err)
+	}
+
+	var commit atp.Commit
+	if err := commit.UnmarshalCBOR(bytes.NewReader(commitBlock.RawData())); err != nil {
+		return nil, fmt.Errorf("parsing commit block: %w", err)
+	}
+
+	tree, err := mst.LoadTreeFromStore(ctx, bs, commit.Data)
+	if err != nil {
+		return nil, fmt.Errorf("loading MST: %w", err)
+	}
+
+	clk := syntax.ClockFromTID(syntax.TID(commit.Rev))
+	return &atp.Repo{
+		DID:         syntax.DID(did),
+		Clock:       &clk,
+		MST:         *tree,
+		RecordStore: bs,
+	}, nil
+}
+
+func commitRepo(ctx context.Context, bs blockstore.Blockstore, r *atp.Repo, signingKey []byte) (cid.Cid, string, error) {
+	if _, err := r.MST.WriteDiffBlocks(ctx, bs); err != nil {
+		return cid.Undef, "", fmt.Errorf("writing MST blocks: %w", err)
+	}
+
+	commit, err := r.Commit()
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("creating commit: %w", err)
+	}
+
+	privkey, err := atcrypto.ParsePrivateBytesK256(signingKey)
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("parsing signing key: %w", err)
+	}
+	if err := commit.Sign(privkey); err != nil {
+		return cid.Undef, "", fmt.Errorf("signing commit: %w", err)
+	}
+
+	buf := new(bytes.Buffer)
+	if err := commit.MarshalCBOR(buf); err != nil {
+		return cid.Undef, "", fmt.Errorf("marshaling commit: %w", err)
+	}
+
+	pref := cid.NewPrefixV1(cid.DagCBOR, multihash.SHA2_256)
+	commitCid, err := pref.Sum(buf.Bytes())
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("computing commit CID: %w", err)
+	}
+
+	blk, err := blocks.NewBlockWithCid(buf.Bytes(), commitCid)
+	if err != nil {
+		return cid.Undef, "", fmt.Errorf("creating commit block: %w", err)
+	}
+	if err := bs.Put(ctx, blk); err != nil {
+		return cid.Undef, "", fmt.Errorf("writing commit block: %w", err)
+	}
+
+	return commitCid, commit.Rev, nil
+}
+
+func putRecordBlock(ctx context.Context, bs blockstore.Blockstore, rec *MarshalableMap) (cid.Cid, error) {
+	buf := new(bytes.Buffer)
+	if err := rec.MarshalCBOR(buf); err != nil {
+		return cid.Undef, err
+	}
+
+	pref := cid.NewPrefixV1(cid.DagCBOR, multihash.SHA2_256)
+	c, err := pref.Sum(buf.Bytes())
+	if err != nil {
+		return cid.Undef, err
+	}
+
+	blk, err := blocks.NewBlockWithCid(buf.Bytes(), c)
+	if err != nil {
+		return cid.Undef, err
+	}
+	if err := bs.Put(ctx, blk); err != nil {
+		return cid.Undef, err
+	}
+
+	return c, nil
+}
+
 // TODO make use of swap commit
 func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []Op, swapCommit *string) ([]ApplyWriteResult, error) {
 	rootcid, err := cid.Cast(urepo.Root)
@@ -105,150 +242,170 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 
 	dbs := rm.s.getBlockstore(urepo.Did)
 	bs := recording_blockstore.New(dbs)
-	r, err := repo.OpenRepo(ctx, bs, rootcid)
 
 	var results []ApplyWriteResult
+	var ops []*atp.Operation
+	var entries []models.Record
+	var newroot cid.Cid
+	var rev string
 
-	entries := make([]models.Record, 0, len(writes))
-	for i, op := range writes {
-		// updates or deletes must supply an rkey
-		if op.Type != OpTypeCreate && op.Rkey == nil {
-			return nil, fmt.Errorf("invalid rkey")
-		} else if op.Type == OpTypeCreate && op.Rkey != nil {
-			// we should conver this op to an update if the rkey already exists
-			_, _, err := r.GetRecord(ctx, fmt.Sprintf("%s/%s", op.Collection, *op.Rkey))
-			if err == nil {
-				op.Type = OpTypeUpdate
+	if err := rm.withRepo(ctx, urepo.Did, rootcid, func(r *atp.Repo) (cid.Cid, error) {
+		entries = make([]models.Record, 0, len(writes))
+		for i, op := range writes {
+			// updates or deletes must supply an rkey
+			if op.Type != OpTypeCreate && op.Rkey == nil {
+				return cid.Undef, fmt.Errorf("invalid rkey")
+			} else if op.Type == OpTypeCreate && op.Rkey != nil {
+				// we should convert this op to an update if the rkey already exists
+				path := fmt.Sprintf("%s/%s", op.Collection, *op.Rkey)
+				existing, _ := r.MST.Get([]byte(path))
+				if existing != nil {
+					op.Type = OpTypeUpdate
+				}
+			} else if op.Rkey == nil {
+				// creates that don't supply an rkey will have one generated for them
+				op.Rkey = to.StringPtr(rm.clock.Next().String())
+				writes[i].Rkey = op.Rkey
 			}
-		} else if op.Rkey == nil {
-			// creates that don't supply an rkey will have one generated for them
-			op.Rkey = to.StringPtr(rm.clock.Next().String())
-			writes[i].Rkey = op.Rkey
+
+			path := fmt.Sprintf("%s/%s", op.Collection, *op.Rkey)
+
+			// validate the record key is actually valid
+			_, err := syntax.ParseRecordKey(*op.Rkey)
+			if err != nil {
+				return cid.Undef, err
+			}
+
+			switch op.Type {
+			case OpTypeCreate:
+				// HACK: this fixes some type conversions, mainly around integers
+				b, err := json.Marshal(*op.Record)
+				if err != nil {
+					return cid.Undef, err
+				}
+				out, err := atdata.UnmarshalJSON(b)
+				if err != nil {
+					return cid.Undef, err
+				}
+				mm := MarshalableMap(out)
+
+				// HACK: if a record doesn't contain a $type, we can manually set it here based on the op's collection
+				if mm["$type"] == "" {
+					mm["$type"] = op.Collection
+				}
+
+				nc, err := putRecordBlock(ctx, bs, &mm)
+				if err != nil {
+					return cid.Undef, err
+				}
+
+				atpOp, err := atp.ApplyOp(&r.MST, path, &nc)
+				if err != nil {
+					return cid.Undef, err
+				}
+				ops = append(ops, atpOp)
+
+				d, err := atdata.MarshalCBOR(mm)
+				if err != nil {
+					return cid.Undef, err
+				}
+
+				entries = append(entries, models.Record{
+					Did:       urepo.Did,
+					CreatedAt: rm.clock.Next().String(),
+					Nsid:      op.Collection,
+					Rkey:      *op.Rkey,
+					Cid:       nc.String(),
+					Value:     d,
+				})
+
+				results = append(results, ApplyWriteResult{
+					Type:             to.StringPtr(OpTypeCreate.String()),
+					Uri:              to.StringPtr("at://" + urepo.Did + "/" + op.Collection + "/" + *op.Rkey),
+					Cid:              to.StringPtr(nc.String()),
+					ValidationStatus: to.StringPtr("valid"), // TODO: obviously this might not be true atm lol
+				})
+			case OpTypeDelete:
+				// try to find the old record in the database
+				var old models.Record
+				if err := rm.db.Raw(ctx, "SELECT value FROM records WHERE did = ? AND nsid = ? AND rkey = ?", nil, urepo.Did, op.Collection, op.Rkey).Scan(&old).Error; err != nil {
+					return cid.Undef, err
+				}
+
+				// TODO: this is really confusing, and looking at it i have no idea why i did this. below when we are doing deletes, we
+				// check if `cid` here is nil to indicate if we should delete. that really doesn't make much sense and its super illogical
+				// when reading this code. i dont feel like fixing right now though so
+				entries = append(entries, models.Record{
+					Did:   urepo.Did,
+					Nsid:  op.Collection,
+					Rkey:  *op.Rkey,
+					Value: old.Value,
+				})
+
+				atpOp, err := atp.ApplyOp(&r.MST, path, nil)
+				if err != nil {
+					return cid.Undef, err
+				}
+				ops = append(ops, atpOp)
+
+				results = append(results, ApplyWriteResult{
+					Type: to.StringPtr(OpTypeDelete.String()),
+				})
+			case OpTypeUpdate:
+				// HACK: same hack as above for type fixes
+				b, err := json.Marshal(*op.Record)
+				if err != nil {
+					return cid.Undef, err
+				}
+				out, err := atdata.UnmarshalJSON(b)
+				if err != nil {
+					return cid.Undef, err
+				}
+				mm := MarshalableMap(out)
+
+				nc, err := putRecordBlock(ctx, bs, &mm)
+				if err != nil {
+					return cid.Undef, err
+				}
+
+				atpOp, err := atp.ApplyOp(&r.MST, path, &nc)
+				if err != nil {
+					return cid.Undef, err
+				}
+				ops = append(ops, atpOp)
+
+				d, err := atdata.MarshalCBOR(mm)
+				if err != nil {
+					return cid.Undef, err
+				}
+
+				entries = append(entries, models.Record{
+					Did:       urepo.Did,
+					CreatedAt: rm.clock.Next().String(),
+					Nsid:      op.Collection,
+					Rkey:      *op.Rkey,
+					Cid:       nc.String(),
+					Value:     d,
+				})
+
+				results = append(results, ApplyWriteResult{
+					Type:             to.StringPtr(OpTypeUpdate.String()),
+					Uri:              to.StringPtr("at://" + urepo.Did + "/" + op.Collection + "/" + *op.Rkey),
+					Cid:              to.StringPtr(nc.String()),
+					ValidationStatus: to.StringPtr("valid"), // TODO: obviously this might not be true atm lol
+				})
+			}
 		}
 
-		// validate the record key is actually valid
-		_, err := syntax.ParseRecordKey(*op.Rkey)
-		if err != nil {
-			return nil, err
+		// commit and get the new root
+		var commitErr error
+		newroot, rev, commitErr = commitRepo(ctx, bs, r, urepo.SigningKey)
+		if commitErr != nil {
+			return cid.Undef, commitErr
 		}
 
-		switch op.Type {
-		case OpTypeCreate:
-			// HACK: this fixes some type conversions, mainly around integers
-			// first we convert to json bytes
-			b, err := json.Marshal(*op.Record)
-			if err != nil {
-				return nil, err
-			}
-			// then we use atdata.UnmarshalJSON to convert it back to a map
-			out, err := atdata.UnmarshalJSON(b)
-			if err != nil {
-				return nil, err
-			}
-			// finally we can cast to a MarshalableMap
-			mm := MarshalableMap(out)
-
-			// HACK: if a record doesn't contain a $type, we can manually set it here based on the op's collection
-			// i forget why this is actually necessary?
-			if mm["$type"] == "" {
-				mm["$type"] = op.Collection
-			}
-
-			nc, err := r.PutRecord(ctx, fmt.Sprintf("%s/%s", op.Collection, *op.Rkey), &mm)
-			if err != nil {
-				return nil, err
-			}
-
-			d, err := atdata.MarshalCBOR(mm)
-			if err != nil {
-				return nil, err
-			}
-
-			entries = append(entries, models.Record{
-				Did:       urepo.Did,
-				CreatedAt: rm.clock.Next().String(),
-				Nsid:      op.Collection,
-				Rkey:      *op.Rkey,
-				Cid:       nc.String(),
-				Value:     d,
-			})
-
-			results = append(results, ApplyWriteResult{
-				Type:             to.StringPtr(OpTypeCreate.String()),
-				Uri:              to.StringPtr("at://" + urepo.Did + "/" + op.Collection + "/" + *op.Rkey),
-				Cid:              to.StringPtr(nc.String()),
-				ValidationStatus: to.StringPtr("valid"), // TODO: obviously this might not be true atm lol
-			})
-		case OpTypeDelete:
-			// try to find the old record in the database
-			var old models.Record
-			if err := rm.db.Raw(ctx, "SELECT value FROM records WHERE did = ? AND nsid = ? AND rkey = ?", nil, urepo.Did, op.Collection, op.Rkey).Scan(&old).Error; err != nil {
-				return nil, err
-			}
-
-			// TODO: this is really confusing, and looking at it i have no idea why i did this. below when we are doing deletes, we
-			// check if `cid` here is nil to indicate if we should delete. that really doesn't make much sense and its super illogical
-			// when reading this code. i dont feel like fixing right now though so
-			entries = append(entries, models.Record{
-				Did:   urepo.Did,
-				Nsid:  op.Collection,
-				Rkey:  *op.Rkey,
-				Value: old.Value,
-			})
-
-			// delete the record from the repo
-			err := r.DeleteRecord(ctx, fmt.Sprintf("%s/%s", op.Collection, *op.Rkey))
-			if err != nil {
-				return nil, err
-			}
-
-			// add a result for the delete
-			results = append(results, ApplyWriteResult{
-				Type: to.StringPtr(OpTypeDelete.String()),
-			})
-		case OpTypeUpdate:
-			// HACK: same hack as above for type fixes
-			b, err := json.Marshal(*op.Record)
-			if err != nil {
-				return nil, err
-			}
-			out, err := atdata.UnmarshalJSON(b)
-			if err != nil {
-				return nil, err
-			}
-			mm := MarshalableMap(out)
-
-			nc, err := r.UpdateRecord(ctx, fmt.Sprintf("%s/%s", op.Collection, *op.Rkey), &mm)
-			if err != nil {
-				return nil, err
-			}
-
-			d, err := atdata.MarshalCBOR(mm)
-			if err != nil {
-				return nil, err
-			}
-
-			entries = append(entries, models.Record{
-				Did:       urepo.Did,
-				CreatedAt: rm.clock.Next().String(),
-				Nsid:      op.Collection,
-				Rkey:      *op.Rkey,
-				Cid:       nc.String(),
-				Value:     d,
-			})
-
-			results = append(results, ApplyWriteResult{
-				Type:             to.StringPtr(OpTypeUpdate.String()),
-				Uri:              to.StringPtr("at://" + urepo.Did + "/" + op.Collection + "/" + *op.Rkey),
-				Cid:              to.StringPtr(nc.String()),
-				ValidationStatus: to.StringPtr("valid"), // TODO: obviously this might not be true atm lol
-			})
-		}
-	}
-
-	// commit and get the new root
-	newroot, rev, err := r.Commit(ctx, urepo.SignFor)
-	if err != nil {
+		return newroot, nil
+	}); err != nil {
 		return nil, err
 	}
 
@@ -270,56 +427,51 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 		return nil, err
 	}
 
-	// get a diff of the changes to the repo
-	diffops, err := r.DiffSince(ctx, rootcid)
-	if err != nil {
-		return nil, err
-	}
-
-	// create the repo ops for the given diff
-	ops := make([]*atproto.SyncSubscribeRepos_RepoOp, 0, len(diffops))
-	for _, op := range diffops {
-		var c cid.Cid
-		switch op.Op {
-		case "add", "mut":
+	// create the repo ops for the firehose from the tracked operations
+	repoOps := make([]*atproto.SyncSubscribeRepos_RepoOp, 0, len(ops))
+	for _, op := range ops {
+		if op.IsCreate() || op.IsUpdate() {
 			kind := "create"
-			if op.Op == "mut" {
+			if op.IsUpdate() {
 				kind = "update"
 			}
 
-			c = op.NewCid
-			ll := lexutil.LexLink(op.NewCid)
-			ops = append(ops, &atproto.SyncSubscribeRepos_RepoOp{
+			ll := lexutil.LexLink(*op.Value)
+			repoOps = append(repoOps, &atproto.SyncSubscribeRepos_RepoOp{
 				Action: kind,
-				Path:   op.Rpath,
+				Path:   op.Path,
 				Cid:    &ll,
 			})
 
-		case "del":
-			c = op.OldCid
-			ll := lexutil.LexLink(op.OldCid)
-			ops = append(ops, &atproto.SyncSubscribeRepos_RepoOp{
+			blk, err := dbs.Get(ctx, *op.Value)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
+				return nil, err
+			}
+		} else if op.IsDelete() {
+			ll := lexutil.LexLink(*op.Prev)
+			repoOps = append(repoOps, &atproto.SyncSubscribeRepos_RepoOp{
 				Action: "delete",
-				Path:   op.Rpath,
+				Path:   op.Path,
 				Cid:    nil,
 				Prev:   &ll,
 			})
-		}
 
-		blk, err := dbs.Get(ctx, c)
-		if err != nil {
-			return nil, err
-		}
-
-		// write the block to the buffer
-		if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
-			return nil, err
+			blk, err := dbs.Get(ctx, *op.Prev)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	// write the writelog to the buffer
-	for _, op := range bs.GetWriteLog() {
-		if _, err := carstore.LdWrite(buf, op.Cid().Bytes(), op.RawData()); err != nil {
+	for _, blk := range bs.GetWriteLog() {
+		if _, err := carstore.LdWrite(buf, blk.Cid().Bytes(), blk.RawData()); err != nil {
 			return nil, err
 		}
 	}
@@ -374,7 +526,7 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 			Since:  &urepo.Rev,
 			Commit: lexutil.LexLink(newroot),
 			Time:   time.Now().Format(time.RFC3339Nano),
-			Ops:    ops,
+			Ops:    repoOps,
 			TooBig: false,
 		},
 	})
@@ -394,28 +546,100 @@ func (rm *RepoMan) applyWrites(ctx context.Context, urepo models.Repo, writes []
 	return results, nil
 }
 
-// this is a fun little guy. to get a proof, we need to read the record out of the blockstore and record how we actually
-// got to the guy. we'll wrap a new blockstore in a recording blockstore, then return the log for proof
 func (rm *RepoMan) getRecordProof(ctx context.Context, urepo models.Repo, collection, rkey string) (cid.Cid, []blocks.Block, error) {
-	c, err := cid.Cast(urepo.Root)
+	commitCid, err := cid.Cast(urepo.Root)
 	if err != nil {
 		return cid.Undef, nil, err
 	}
 
 	dbs := rm.s.getBlockstore(urepo.Did)
-	bs := recording_blockstore.New(dbs)
 
-	r, err := repo.OpenRepo(ctx, bs, c)
-	if err != nil {
+	var proofBlocks []blocks.Block
+	var recordCid *cid.Cid
+
+	if err := rm.withRepo(ctx, urepo.Did, commitCid, func(r *atp.Repo) (cid.Cid, error) {
+		path := collection + "/" + rkey
+
+		// walk the cached in-memory tree to find the record and collect MST node CIDs on the path
+		nodeCIDs := collectPathNodeCIDs(r.MST.Root, []byte(path))
+
+		rc, getErr := r.MST.Get([]byte(path))
+		if getErr != nil {
+			return cid.Undef, getErr
+		}
+		if rc == nil {
+			return cid.Undef, fmt.Errorf("record not found: %s", path)
+		}
+		recordCid = rc
+
+		// read the commit block
+		commitBlk, err := dbs.Get(ctx, commitCid)
+		if err != nil {
+			return cid.Undef, fmt.Errorf("reading commit block for proof: %w", err)
+		}
+		proofBlocks = append(proofBlocks, commitBlk)
+
+		// read the MST nodes on the path
+		for _, nc := range nodeCIDs {
+			blk, err := dbs.Get(ctx, nc)
+			if err != nil {
+				return cid.Undef, fmt.Errorf("reading MST node for proof: %w", err)
+			}
+			proofBlocks = append(proofBlocks, blk)
+		}
+
+		// read the record block
+		recordBlk, err := dbs.Get(ctx, *recordCid)
+		if err != nil {
+			return cid.Undef, fmt.Errorf("reading record block for proof: %w", err)
+		}
+		proofBlocks = append(proofBlocks, recordBlk)
+
+		// read-only, return same root
+		return commitCid, nil
+	}); err != nil {
 		return cid.Undef, nil, err
 	}
 
-	_, _, err = r.GetRecordBytes(ctx, fmt.Sprintf("%s/%s", collection, rkey))
-	if err != nil {
-		return cid.Undef, nil, err
+	return commitCid, proofBlocks, nil
+}
+
+func collectPathNodeCIDs(n *mst.Node, key []byte) []cid.Cid {
+	if n == nil {
+		return nil
 	}
 
-	return c, bs.GetReadLog(), nil
+	var cids []cid.Cid
+	if n.CID != nil {
+		cids = append(cids, *n.CID)
+	}
+
+	height := mst.HeightForKey(key)
+	if height >= n.Height {
+		// key is at or above this level, no need to descend
+		return cids
+	}
+
+	// find the child node that covers this key
+	childIdx := -1
+	for i, e := range n.Entries {
+		if e.IsChild() {
+			childIdx = i
+			continue
+		}
+		if e.IsValue() {
+			if bytes.Compare(key, e.Key) <= 0 {
+				break
+			}
+			childIdx = -1
+		}
+	}
+
+	if childIdx >= 0 && n.Entries[childIdx].Child != nil {
+		cids = append(cids, collectPathNodeCIDs(n.Entries[childIdx].Child, key)...)
+	}
+
+	return cids
 }
 
 func (rm *RepoMan) incrementBlobRefs(ctx context.Context, urepo models.Repo, cbor []byte) ([]cid.Cid, error) {
