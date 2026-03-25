@@ -1,7 +1,7 @@
 # Cocoon
 
 > [!WARNING]
-I migrated and have been running my main account on this PDS for months now without issue, however, I am still not responsible if things go awry, particularly during account migration. Please use caution.
+> I migrated and have been running my main account on this PDS for months now without issue, however, I am still not responsible if things go awry, particularly during account migration. Please use caution.
 
 Cocoon is a PDS implementation in Go. It is highly experimental, and is not ready for any production use.
 
@@ -169,6 +169,27 @@ COCOON_S3_CDN_URL="https://cdn.example.com"
 - With `COCOON_S3_CDN_URL`: `getBlob` returns a 302 redirect to `{CDN_URL}/blobs/{did}/{cid}`
 
 > **Tip**: For Cloudflare R2, you can use the public bucket URL as the CDN URL. For AWS S3, you can use CloudFront or the S3 bucket URL directly if public access is enabled.
+
+#### Alpine based image
+
+The default image is based on Debian. You can use the Alpine-based image if you prefer.
+
+> [!NOTE]
+> Currently, we do not have pre-built Alpine-based image on the GitHub Container Registry. You have to build them locally.
+
+In the compose file, replace every `dockerfile: Dockerfile` by `dockerfile: Dockerfile.alpine`, e.g.
+```yml
+services:
+  cocoon:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpine
+```
+
+You can also build the image locally with
+```bash
+docker build -f Dockerfile.alpine -t cocoon:alpine .
+```
 
 ### Management Commands
 
