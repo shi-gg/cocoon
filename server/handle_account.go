@@ -32,6 +32,8 @@ func (s *Server) handleAccount(e echo.Context) error {
 		sess.AddFlash("Unable to fetch sessions. See server logs for more details.", "error")
 		sess.Save(e.Request(), e.Response())
 		return e.Render(200, "account.html", map[string]any{
+			"Repo":      repo,
+			"Tokens":    []map[string]string{},
 			"flashes":   getFlashesFromSession(e, sess),
 			"Accounts":  accounts,
 			"ActiveDid": repo.Repo.Did,

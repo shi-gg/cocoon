@@ -1,12 +1,12 @@
 package server
 
 import (
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 
 	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/gorilla/sessions"
 	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
@@ -61,7 +61,29 @@ func mergeRedirectQuery(redirect string, queryParams string) (string, error) {
 	return parsedRedirect.String(), nil
 }
 
+func isSameOriginRequest(e echo.Context) bool {
+	host := e.Request().Host
+
+	origin := strings.TrimSpace(e.Request().Header.Get("Origin"))
+	if origin != "" {
+		parsedOrigin, err := url.Parse(origin)
+		return err == nil && parsedOrigin.Host == host
+	}
+
+	referer := strings.TrimSpace(e.Request().Header.Get("Referer"))
+	if referer != "" {
+		parsedReferer, err := url.Parse(referer)
+		return err == nil && parsedReferer.Host == host
+	}
+
+	return false
+}
+
 func (s *Server) handleAccountSwitchPost(e echo.Context) error {
+	if !isSameOriginRequest(e) {
+		return e.JSON(http.StatusForbidden, map[string]string{"error": "Forbidden"})
+	}
+
 	var req AccountSwitchRequest
 	if err := e.Bind(&req); err != nil {
 		return helpers.InputError(e, to.StringPtr("invalid switch account request"))
@@ -78,11 +100,7 @@ func (s *Server) handleAccountSwitchPost(e echo.Context) error {
 	}
 
 	setActiveSessionDid(sess, req.Did)
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   int(AccountSessionMaxAge.Seconds()),
-		HttpOnly: true,
-	}
+	applyAccountSessionOptions(sess, int(AccountSessionMaxAge.Seconds()))
 
 	if err := sess.Save(e.Request(), e.Response()); err != nil {
 		return err

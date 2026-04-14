@@ -1,7 +1,6 @@
 package server
 
 import (
-	"github.com/gorilla/sessions"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
 )
@@ -22,11 +21,7 @@ func (s *Server) handleAccountSignout(e echo.Context) error {
 		maxAge = -1
 	}
 
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   maxAge,
-		HttpOnly: true,
-	}
+	applyAccountSessionOptions(sess, maxAge)
 
 	if err := sess.Save(e.Request(), e.Response()); err != nil {
 		return err

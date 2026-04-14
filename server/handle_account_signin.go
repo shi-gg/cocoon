@@ -38,6 +38,7 @@ func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoAct
 		return nil, sess, nil, err
 	}
 	if changed {
+		applyAccountSessionOptions(sess, int(AccountSessionMaxAge.Seconds()))
 		if err := sess.Save(e.Request(), e.Response()); err != nil {
 			return nil, sess, nil, err
 		}
@@ -48,9 +49,9 @@ func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoAct
 		return nil, sess, accounts, fmt.Errorf("%w: did was not set in session", ErrSessionUnauthenticated)
 	}
 
-	for _, account := range accounts {
-		if account.Repo.Did == did {
-			return &account, sess, accounts, nil
+	for i := range accounts {
+		if accounts[i].Repo.Did == did {
+			return &accounts[i], sess, accounts, nil
 		}
 	}
 
@@ -193,11 +194,7 @@ func (s *Server) handleAccountSigninPost(e echo.Context) error {
 		}
 	}
 
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   int(AccountSessionMaxAge.Seconds()),
-		HttpOnly: true,
-	}
+	applyAccountSessionOptions(sess, int(AccountSessionMaxAge.Seconds()))
 
 	setActiveSessionDid(sess, repo.Repo.Did)
 

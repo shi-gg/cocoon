@@ -55,6 +55,8 @@ func (s *Server) handleOauthAuthorizeGet(e echo.Context) error {
 					"AppName":    "DEV MODE AUTHORIZATION PAGE",
 					"Handle":     "paula.cocoon.social",
 					"RequestUri": "",
+					"Accounts":   []string{},
+					"ActiveDid":  "",
 				})
 			}
 			return helpers.InputError(e, to.StringPtr("no request uri and invalid parameters"))
@@ -126,6 +128,7 @@ func (s *Server) handleOauthAuthorizeGet(e echo.Context) error {
 		}
 
 		setActiveSessionDid(sess, did)
+		applyAccountSessionOptions(sess, int(AccountSessionMaxAge.Seconds()))
 		if err := sess.Save(e.Request(), e.Response()); err != nil {
 			return helpers.ServerError(e, to.StringPtr(err.Error()))
 		}
