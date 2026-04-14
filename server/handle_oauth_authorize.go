@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
@@ -132,6 +133,9 @@ func (s *Server) handleOauthAuthorizeGet(e echo.Context) error {
 
 	repo, _, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
 	if err != nil {
+		if !errors.Is(err, ErrSessionUnauthenticated) {
+			return helpers.ServerError(e, to.StringPtr(err.Error()))
+		}
 		return e.Redirect(303, "/account/signin?"+e.QueryParams().Encode())
 	}
 
@@ -162,6 +166,9 @@ func (s *Server) handleOauthAuthorizePost(e echo.Context) error {
 
 	repo, _, err := s.getSessionRepoOrErr(e)
 	if err != nil {
+		if !errors.Is(err, ErrSessionUnauthenticated) {
+			return helpers.ServerError(e, to.StringPtr(err.Error()))
+		}
 		return e.Redirect(303, "/account/signin")
 	}
 

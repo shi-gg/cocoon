@@ -23,6 +23,8 @@ type OauthSigninInput struct {
 	QueryParams     string `form:"query_params"`
 }
 
+var ErrSessionUnauthenticated = errors.New("session is unauthenticated")
+
 func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, []models.RepoActor, error) {
 	ctx := e.Request().Context()
 
@@ -43,7 +45,7 @@ func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoAct
 
 	did := getActiveSessionDid(sess)
 	if did == "" {
-		return nil, sess, accounts, errors.New("did was not set in session")
+		return nil, sess, accounts, fmt.Errorf("%w: did was not set in session", ErrSessionUnauthenticated)
 	}
 
 	for _, account := range accounts {
@@ -52,7 +54,7 @@ func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoAct
 		}
 	}
 
-	return nil, sess, accounts, errors.New("did was not found in session accounts")
+	return nil, sess, accounts, fmt.Errorf("%w: did was not found in session accounts", ErrSessionUnauthenticated)
 }
 
 func (s *Server) getSessionRepoOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, error) {
@@ -71,6 +73,9 @@ func getFlashesFromSession(e echo.Context, sess *sessions.Session) map[string]an
 
 func (s *Server) handleAccountSigninGet(e echo.Context) error {
 	repo, sess, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
+	if err != nil && !errors.Is(err, ErrSessionUnauthenticated) {
+		return helpers.ServerError(e, nil)
+	}
 	if err == nil && e.QueryString() == "" {
 		return e.Redirect(303, "/account")
 	}

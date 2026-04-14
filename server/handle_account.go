@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"time"
 
+	"github.com/haileyok/cocoon/internal/helpers"
 	"github.com/haileyok/cocoon/oauth"
 	"github.com/haileyok/cocoon/oauth/constants"
 	"github.com/haileyok/cocoon/oauth/provider"
@@ -16,6 +18,9 @@ func (s *Server) handleAccount(e echo.Context) error {
 
 	repo, sess, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
 	if err != nil {
+		if !errors.Is(err, ErrSessionUnauthenticated) {
+			return helpers.ServerError(e, nil)
+		}
 		return e.Redirect(303, "/account/signin")
 	}
 
