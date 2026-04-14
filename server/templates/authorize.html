@@ -24,7 +24,7 @@
         <label for="did">Switch to another signed-in account</label>
         <select name="did" id="did">
           {{ range .Accounts }}
-          <option value="{{ .Did }}" {{ if eq .Did $.ActiveDid }}selected{{ end }}>
+          <option value="{{ .Repo.Did }}" {{ if eq .Repo.Did $.ActiveDid }}selected{{ end }}>
             {{ .Handle }}
           </option>
           {{ end }}

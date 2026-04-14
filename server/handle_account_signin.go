@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,10 +28,17 @@ var ErrSessionUnauthenticated = errors.New("session is unauthenticated")
 
 func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, []models.RepoActor, error) {
 	ctx := e.Request().Context()
-
 	sess, err := session.Get(s.config.SessionCookieKey, e)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+
+	return s.getSessionRepoAndAccountsFromSessionOrErr(e, ctx, sess)
+}
+
+func (s *Server) getSessionRepoAndAccountsFromSessionOrErr(e echo.Context, ctx context.Context, sess *sessions.Session) (*models.RepoActor, *sessions.Session, []models.RepoActor, error) {
+	if sess == nil {
+		return nil, nil, nil, errors.New("session is nil")
 	}
 
 	accounts, changed, err := s.getSessionAccountActors(ctx, sess)

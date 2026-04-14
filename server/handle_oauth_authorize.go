@@ -134,7 +134,7 @@ func (s *Server) handleOauthAuthorizeGet(e echo.Context) error {
 		}
 	}
 
-	repo, _, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
+	repo, _, accounts, err := s.getSessionRepoAndAccountsFromSessionOrErr(e, ctx, sess)
 	if err != nil {
 		if !errors.Is(err, ErrSessionUnauthenticated) {
 			return helpers.ServerError(e, to.StringPtr(err.Error()))
