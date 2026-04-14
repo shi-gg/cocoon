@@ -14,20 +14,9 @@ func (s *Server) handleAccount(e echo.Context) error {
 	ctx := e.Request().Context()
 	logger := s.logger.With("name", "handleAuth")
 
-	repo, sess, err := s.getSessionRepoOrErr(e)
+	repo, sess, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
 	if err != nil {
 		return e.Redirect(303, "/account/signin")
-	}
-
-	accounts, changed, err := s.getSessionAccountActors(ctx, sess)
-	if err != nil {
-		logger.Error("couldnt fetch signed-in accounts", "error", err)
-		accounts = nil
-	}
-	if changed {
-		if err := sess.Save(e.Request(), e.Response()); err != nil {
-			return err
-		}
 	}
 
 	oldestPossibleSession := time.Now().Add(constants.ConfidentialClientSessionLifetime)

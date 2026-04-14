@@ -130,19 +130,9 @@ func (s *Server) handleOauthAuthorizeGet(e echo.Context) error {
 		}
 	}
 
-	repo, _, err := s.getSessionRepoOrErr(e)
+	repo, _, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
 	if err != nil {
 		return e.Redirect(303, "/account/signin?"+e.QueryParams().Encode())
-	}
-
-	accounts, changed, err := s.getSessionAccountActors(ctx, sess)
-	if err != nil {
-		return helpers.ServerError(e, to.StringPtr(err.Error()))
-	}
-	if changed {
-		if err := sess.Save(e.Request(), e.Response()); err != nil {
-			return helpers.ServerError(e, to.StringPtr(err.Error()))
-		}
 	}
 
 	scopes := strings.Split(req.Parameters.Scope, " ")

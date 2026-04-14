@@ -23,36 +23,41 @@ type OauthSigninInput struct {
 	QueryParams     string `form:"query_params"`
 }
 
-func (s *Server) getSessionRepoOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, error) {
+func (s *Server) getSessionRepoAndAccountsOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, []models.RepoActor, error) {
 	ctx := e.Request().Context()
 
 	sess, err := session.Get(s.config.SessionCookieKey, e)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	accounts, changed, err := s.getSessionAccountActors(ctx, sess)
 	if err != nil {
-		return nil, sess, err
+		return nil, sess, nil, err
 	}
 	if changed {
 		if err := sess.Save(e.Request(), e.Response()); err != nil {
-			return nil, sess, err
+			return nil, sess, nil, err
 		}
 	}
 
 	did := getActiveSessionDid(sess)
 	if did == "" {
-		return nil, sess, errors.New("did was not set in session")
+		return nil, sess, accounts, errors.New("did was not set in session")
 	}
 
 	for _, account := range accounts {
 		if account.Repo.Did == did {
-			return &account, sess, nil
+			return &account, sess, accounts, nil
 		}
 	}
 
-	return nil, sess, errors.New("did was not found in session accounts")
+	return nil, sess, accounts, errors.New("did was not found in session accounts")
+}
+
+func (s *Server) getSessionRepoOrErr(e echo.Context) (*models.RepoActor, *sessions.Session, error) {
+	repo, sess, _, err := s.getSessionRepoAndAccountsOrErr(e)
+	return repo, sess, err
 }
 
 func getFlashesFromSession(e echo.Context, sess *sessions.Session) map[string]any {
@@ -65,28 +70,13 @@ func getFlashesFromSession(e echo.Context, sess *sessions.Session) map[string]an
 }
 
 func (s *Server) handleAccountSigninGet(e echo.Context) error {
-	ctx := e.Request().Context()
-
-	repo, sess, err := s.getSessionRepoOrErr(e)
+	repo, sess, accounts, err := s.getSessionRepoAndAccountsOrErr(e)
 	if err == nil && e.QueryString() == "" {
 		return e.Redirect(303, "/account")
 	}
 
 	if sess == nil {
-		sess, _ = session.Get(s.config.SessionCookieKey, e)
-	}
-	if sess == nil {
 		return helpers.ServerError(e, nil)
-	}
-
-	accounts, changed, accountsErr := s.getSessionAccountActors(ctx, sess)
-	if accountsErr != nil {
-		accounts = nil
-	}
-	if changed {
-		if err := sess.Save(e.Request(), e.Response()); err != nil {
-			return helpers.ServerError(e, nil)
-		}
 	}
 
 	activeDid := ""
