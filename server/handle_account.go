@@ -19,6 +19,17 @@ func (s *Server) handleAccount(e echo.Context) error {
 		return e.Redirect(303, "/account/signin")
 	}
 
+	accounts, changed, err := s.getSessionAccountActors(ctx, sess)
+	if err != nil {
+		logger.Error("couldnt fetch signed-in accounts", "error", err)
+		accounts = nil
+	}
+	if changed {
+		if err := sess.Save(e.Request(), e.Response()); err != nil {
+			return err
+		}
+	}
+
 	oldestPossibleSession := time.Now().Add(constants.ConfidentialClientSessionLifetime)
 
 	var tokens []provider.OauthToken
@@ -27,7 +38,9 @@ func (s *Server) handleAccount(e echo.Context) error {
 		sess.AddFlash("Unable to fetch sessions. See server logs for more details.", "error")
 		sess.Save(e.Request(), e.Response())
 		return e.Render(200, "account.html", map[string]any{
-			"flashes": getFlashesFromSession(e, sess),
+			"flashes":   getFlashesFromSession(e, sess),
+			"Accounts":  accounts,
+			"ActiveDid": repo.Repo.Did,
 		})
 	}
 
@@ -69,8 +82,10 @@ func (s *Server) handleAccount(e echo.Context) error {
 	}
 
 	return e.Render(200, "account.html", map[string]any{
-		"Repo":    repo,
-		"Tokens":  tokenInfo,
-		"flashes": getFlashesFromSession(e, sess),
+		"Repo":      repo,
+		"Tokens":    tokenInfo,
+		"flashes":   getFlashesFromSession(e, sess),
+		"Accounts":  accounts,
+		"ActiveDid": repo.Repo.Did,
 	})
 }

@@ -31,17 +31,28 @@ func (s *Server) getSessionRepoOrErr(e echo.Context) (*models.RepoActor, *sessio
 		return nil, nil, err
 	}
 
-	did, ok := sess.Values["did"].(string)
-	if !ok {
-		return nil, sess, errors.New("did was not set in session")
-	}
-
-	repo, err := s.getRepoActorByDid(ctx, did)
+	accounts, changed, err := s.getSessionAccountActors(ctx, sess)
 	if err != nil {
 		return nil, sess, err
 	}
+	if changed {
+		if err := sess.Save(e.Request(), e.Response()); err != nil {
+			return nil, sess, err
+		}
+	}
 
-	return repo, sess, nil
+	did := getActiveSessionDid(sess)
+	if did == "" {
+		return nil, sess, errors.New("did was not set in session")
+	}
+
+	for _, account := range accounts {
+		if account.Repo.Did == did {
+			return &account, sess, nil
+		}
+	}
+
+	return nil, sess, errors.New("did was not found in session accounts")
 }
 
 func getFlashesFromSession(e echo.Context, sess *sessions.Session) map[string]any {
@@ -54,14 +65,40 @@ func getFlashesFromSession(e echo.Context, sess *sessions.Session) map[string]an
 }
 
 func (s *Server) handleAccountSigninGet(e echo.Context) error {
-	_, sess, err := s.getSessionRepoOrErr(e)
-	if err == nil {
+	ctx := e.Request().Context()
+
+	repo, sess, err := s.getSessionRepoOrErr(e)
+	if err == nil && e.QueryString() == "" {
 		return e.Redirect(303, "/account")
+	}
+
+	if sess == nil {
+		sess, _ = session.Get(s.config.SessionCookieKey, e)
+	}
+	if sess == nil {
+		return helpers.ServerError(e, nil)
+	}
+
+	accounts, changed, accountsErr := s.getSessionAccountActors(ctx, sess)
+	if accountsErr != nil {
+		accounts = nil
+	}
+	if changed {
+		if err := sess.Save(e.Request(), e.Response()); err != nil {
+			return helpers.ServerError(e, nil)
+		}
+	}
+
+	activeDid := ""
+	if repo != nil {
+		activeDid = repo.Repo.Did
 	}
 
 	return e.Render(200, "signin.html", map[string]any{
 		"flashes":     getFlashesFromSession(e, sess),
 		"QueryParams": e.QueryParams().Encode(),
+		"Accounts":    accounts,
+		"ActiveDid":   activeDid,
 	})
 }
 
@@ -167,8 +204,7 @@ func (s *Server) handleAccountSigninPost(e echo.Context) error {
 		HttpOnly: true,
 	}
 
-	sess.Values = map[any]any{}
-	sess.Values["did"] = repo.Repo.Did
+	setActiveSessionDid(sess, repo.Repo.Did)
 
 	if err := sess.Save(e.Request(), e.Response()); err != nil {
 		return err

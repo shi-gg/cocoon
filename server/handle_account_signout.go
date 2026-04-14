@@ -12,13 +12,21 @@ func (s *Server) handleAccountSignout(e echo.Context) error {
 		return err
 	}
 
-	sess.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
+	activeDid := getActiveSessionDid(sess)
+	if activeDid != "" {
+		removeSessionDid(sess, activeDid)
 	}
 
-	sess.Values = map[any]any{}
+	maxAge := int(AccountSessionMaxAge.Seconds())
+	if len(getSessionDids(sess)) == 0 {
+		maxAge = -1
+	}
+
+	sess.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   maxAge,
+		HttpOnly: true,
+	}
 
 	if err := sess.Save(e.Request(), e.Response()); err != nil {
 		return err
