@@ -35,6 +35,32 @@ func sanitizeLocalRedirectPath(next string) string {
 	return redirect
 }
 
+func mergeRedirectQuery(redirect string, queryParams string) (string, error) {
+	parsedRedirect, err := url.Parse(redirect)
+	if err != nil {
+		return "", err
+	}
+
+	merged := parsedRedirect.Query()
+
+	rawQueryParams := strings.TrimSpace(queryParams)
+	if rawQueryParams != "" {
+		rawQueryParams = strings.TrimPrefix(rawQueryParams, "?")
+		additional, err := url.ParseQuery(rawQueryParams)
+		if err != nil {
+			return "", err
+		}
+		for key, values := range additional {
+			for _, value := range values {
+				merged.Add(key, value)
+			}
+		}
+	}
+
+	parsedRedirect.RawQuery = merged.Encode()
+	return parsedRedirect.String(), nil
+}
+
 func (s *Server) handleAccountSwitchPost(e echo.Context) error {
 	var req AccountSwitchRequest
 	if err := e.Bind(&req); err != nil {
@@ -63,8 +89,9 @@ func (s *Server) handleAccountSwitchPost(e echo.Context) error {
 	}
 
 	redirect := sanitizeLocalRedirectPath(req.Next)
-	if req.QueryParams != "" {
-		redirect += "?" + req.QueryParams
+	redirect, err = mergeRedirectQuery(redirect, req.QueryParams)
+	if err != nil {
+		return helpers.InputError(e, to.StringPtr("invalid query params"))
 	}
 
 	return e.Redirect(303, redirect)
