@@ -1,7 +1,7 @@
 package server
 
 import (
-	"bytes"
+	"io"
 
 	"github.com/bluesky-social/indigo/carstore"
 	"github.com/haileyok/cocoon/internal/helpers"
@@ -36,23 +36,47 @@ func (s *Server) handleSyncGetRepo(e echo.Context) error {
 		Version: 1,
 	})
 
-	buf := new(bytes.Buffer)
-
-	if _, err := carstore.LdWrite(buf, hb); err != nil {
-		logger.Error("error writing to car", "error", err)
-		return helpers.ServerError(e, nil)
-	}
-
-	var blocks []models.Block
-	if err := s.db.Raw(ctx, "SELECT * FROM blocks WHERE did = ? ORDER BY rev ASC", nil, urepo.Repo.Did).Scan(&blocks).Error; err != nil {
+	if err != nil {
 		return err
 	}
 
-	for _, block := range blocks {
-		if _, err := carstore.LdWrite(buf, block.Cid, block.Value); err != nil {
+	r, w := io.Pipe()
+	go func() {
+		var writeErr error
+		writeErr = streamCar(w, s, urepo.Repo.Did, hb)
+		if writeErr != nil {
+			logger.Error("error streaming car", "error", writeErr)
+		}
+		w.CloseWithError(writeErr)
+	}()
+
+	return e.Stream(200, "application/vnd.ipld.car", r)
+}
+
+func streamCar(w io.Writer, s *Server, did string, hb []byte) error {
+	if _, err := carstore.LdWrite(w, hb); err != nil {
+		return err
+	}
+
+	rows, err := s.db.Client().
+		Model(&models.Block{}).
+		Where("did = ?", did).
+		Order("rev ASC").
+		Rows()
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var block models.Block
+		if err := s.db.Client().ScanRows(rows, &block); err != nil {
+			return err
+		}
+		if _, err := carstore.LdWrite(w, block.Cid, block.Value); err != nil {
 			return err
 		}
 	}
 
-	return e.Stream(200, "application/vnd.ipld.car", bytes.NewReader(buf.Bytes()))
+	return rows.Err()
 }
