@@ -66,15 +66,14 @@ func (s *Server) handleDescribeRepo(e echo.Context) error {
 		}
 	}
 
-	var records []models.Record
-	if err := s.db.Raw(ctx, "SELECT DISTINCT(nsid) FROM records WHERE did = ?", nil, repo.Repo.Did).Scan(&records).Error; err != nil {
+	var collections []string
+	if err := s.db.Client().WithContext(ctx).
+		Model(&models.Record{}).
+		Where("did = ?", repo.Repo.Did).
+		Distinct("nsid").
+		Pluck("nsid", &collections).Error; err != nil {
 		logger.Error("error getting collections", "error", err)
 		return helpers.ServerError(e, nil)
-	}
-
-	var collections []string = make([]string, 0, len(records))
-	for _, r := range records {
-		collections = append(collections, r.Nsid)
 	}
 
 	return e.JSON(200, ComAtprotoRepoDescribeRepoResponse{
